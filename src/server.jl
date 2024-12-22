@@ -243,7 +243,7 @@ $(TYPEDSIGNATURES)
 Close and free the bind.
 """
 function Base.close(bind::Bind)
-    if isopen(bind)
+    @lock bind if isopen(bind)
         lib.ssh_bind_free(bind)
         bind.ptr = nothing
     end
@@ -262,6 +262,9 @@ $(TYPEDSIGNATURES)
 Unlock a bind.
 """
 Base.unlock(bind::Bind) = unlock(bind._lock)
+
+Base.islocked(bind::Bind) = islocked(bind._lock)
+Base.trylock(bind::Bind) = trylock(bind._lock)
 
 """
 $(TYPEDSIGNATURES)
@@ -296,57 +299,55 @@ union_types(x::Union) = (x.a, union_types(x.b)...)
 union_types(x::Type) = (x,)
 
 function Base.setproperty!(bind::Bind, name::Symbol, value)
-    @lock bind begin
-        if name ∉ fieldnames(Bind)
-            error("type Bind has no field $(name)")
-        end
-
-        ret = -1
-
-        if name ∉ keys(BIND_PROPERTY_OPTIONS)
-            return setfield!(bind, name, value)
-        else
-            # We don't allow 'unsetting' options, that would be too complicated to implement
-            if isnothing(value)
-                throw(ArgumentError("Setting Bind options to nothing is unsupported"))
-            end
-
-            # There's some weirdness around saving strings, so we do some special-casing
-            # here to handle them.
-            option, ctype = BIND_PROPERTY_OPTIONS[name]
-            is_string = ctype == Cstring
-            GC.@preserve value begin
-                cvalue = if is_string
-                    Ptr{Cvoid}(Base.unsafe_convert(ctype, value))
-                elseif value isa PKI.SshKey
-                    value.ptr
-                else
-                    Ref(Base.cconvert(ctype, value))
-                end
-
-                ret = lib.ssh_bind_options_set(bind, option, cvalue)
-            end
-        end
-
-        if ret != 0
-            throw(LibSSHException("Error setting Bind.$(name) to $(value): $(ret)"))
-        end
-
-        # Get the type of the field in the struct. Some of them are unions, in which
-        # case we select the first non-Nothing type in the Union. If the saved type
-        # doesn't match the type of the passed value, we convert it.
-        final_value = value
-        saved_type = fieldtype(Bind, name)
-        if saved_type isa Union
-            possible_types = filter(!=(Nothing), union_types(saved_type))
-            saved_type = possible_types[1]
-        end
-        if !(value isa saved_type)
-            final_value = saved_type(value)
-        end
-
-        return setfield!(bind, name, final_value)
+    if name ∉ fieldnames(Bind)
+        error("type Bind has no field $(name)")
     end
+
+    ret = -1
+
+    if name ∉ keys(BIND_PROPERTY_OPTIONS)
+        return setfield!(bind, name, value)
+    else
+        # We don't allow 'unsetting' options, that would be too complicated to implement
+        if isnothing(value)
+            throw(ArgumentError("Setting Bind options to nothing is unsupported"))
+        end
+
+        # There's some weirdness around saving strings, so we do some special-casing
+        # here to handle them.
+        option, ctype = BIND_PROPERTY_OPTIONS[name]
+        is_string = ctype == Cstring
+        GC.@preserve value begin
+            cvalue = if is_string
+                Ptr{Cvoid}(Base.unsafe_convert(ctype, value))
+            elseif value isa PKI.SshKey
+                value.ptr
+            else
+                Ref(Base.cconvert(ctype, value))
+            end
+
+            ret = lib.ssh_bind_options_set(bind, option, cvalue)
+        end
+    end
+
+    if ret != 0
+        throw(LibSSHException("Error setting Bind.$(name) to $(value): $(ret)"))
+    end
+
+    # Get the type of the field in the struct. Some of them are unions, in which
+    # case we select the first non-Nothing type in the Union. If the saved type
+    # doesn't match the type of the passed value, we convert it.
+    final_value = value
+    saved_type = fieldtype(Bind, name)
+    if saved_type isa Union
+        possible_types = filter(!=(Nothing), union_types(saved_type))
+        saved_type = possible_types[1]
+    end
+    if !(value isa saved_type)
+        final_value = saved_type(value)
+    end
+
+    return setfield!(bind, name, final_value)
 end
 
 # Wrapper around the user-defined message callback
@@ -395,13 +396,25 @@ function listen(handler::Function, bind::Bind; poll_timeout=0.1)
 
     fd = RawFD(lib.ssh_bind_get_fd(bind))
     while isopen(bind)
+        # Always yield within the loop to ensure that other tasks have a chance
+        # to take a lock on the bind. Otherwise we would potentially only yield
+        # while the bind is locked. We hackily use sleep() instead of yield()
+        # here because the bind is locked for the majority of the loop time and
+        # yield() alone doesn't give other tasks/threads enough time to take the
+        # lock (e.g. to close it).
+        sleep(0.001)
+
         # Notify listeners that we've started
         if !bind._listener_started
             bind._listener_started = true
             notify(bind._listener_event)
         end
 
-        poll_result = _safe_poll_fd(fd, poll_timeout; readable=true)
+        # Lock the bind to avoid its file descriptor being closed by another
+        # while in the middle of polling it, which causes inscrutable libuv
+        # segfaults.
+        poll_result = @lock bind _safe_poll_fd(fd, poll_timeout; readable=true)
+
         if isnothing(poll_result)
             # This means the session's file descriptor has been closed (see the
             # comments for _safe_poll_fd()).
@@ -581,7 +594,7 @@ function on_channel_open(session, client)::Union{ssh.SshChannel, Nothing}
     _add_log_event!(client, :channel_open, true)
     sshchan = ssh.SshChannel(client.session)
     ssh.set_channel_callbacks(sshchan, client.channel_callbacks)
-    push!(client.unclaimed_channels, sshchan)
+    @lock client push!(client.unclaimed_channels, sshchan)
 
     return sshchan
 end
@@ -589,7 +602,7 @@ end
 function on_channel_env_request(session, sshchan, name, value, client)::Bool
     _add_log_event!(client, :channel_env_request, (name, value))
 
-    client.env[name] = value
+    @lock client client.env[name] = value
 
     return true
 end
@@ -597,7 +610,8 @@ end
 function on_channel_exec_request(session, sshchan, command, client)::Bool
     _add_log_event!(client, :channel_exec_request, "'$command'")
     owning_sshchan = find_unclaimed_channel(client, sshchan)
-    push!(client.channel_operations, CommandExecutor(client, command, owning_sshchan, client.env))
+
+    @lock client push!(client.channel_operations, CommandExecutor(client, command, owning_sshchan, client.env))
 
     return true
 end
@@ -618,16 +632,18 @@ end
 function on_channel_close(session, sshchan, client)::Nothing
     _add_log_event!(client, :channel_close, true)
 
-    all_channels = copy(client.unclaimed_channels)
-    for op in client.channel_operations
-        append!(all_channels, getchannels(op))
-    end
+    @lock client begin
+        all_channels = copy(client.unclaimed_channels)
+        for op in client.channel_operations
+            append!(all_channels, getchannels(op))
+        end
 
-    # It's ok if we don't find a matching channel, that just means that we've
-    # already closed it from our side.
-    idx = findfirst(x -> x.ptr == sshchan.ptr, all_channels)
-    if !isnothing(idx)
-        close(all_channels[idx])
+        # It's ok if we don't find a matching channel, that just means that we've
+        # already closed it from our side.
+        idx = findfirst(x -> x.ptr == sshchan.ptr, all_channels)
+        if !isnothing(idx)
+            close(all_channels[idx])
+        end
     end
 end
 
@@ -712,6 +728,7 @@ end
     password::Union{String, Nothing}
     allow_auth_none::Bool = false
     authenticated::Bool = false
+    lock::ReentrantLock = ReentrantLock()
 
     session_event::Union{ssh.SessionEvent, Nothing} = nothing
     channel_callbacks::ChannelCallbacks = ChannelCallbacks()
@@ -728,6 +745,9 @@ end
     log_id::Int = 1
     callback_log::Dict{Symbol, Vector} = Dict{Symbol, Vector}()
 end
+
+Base.lock(client::Client) = lock(client.lock)
+Base.unlock(client::Client) = unlock(client.lock)
 
 function Base.show(io::IO, client::Client)
     print(io, Client, "(id=$(client.id), session=$(client.session))")
@@ -771,12 +791,14 @@ double-free later when we close `client.sshchan`. That's why close()'ing
 non-owning SshChannels is forbidden.
 =#
 function find_unclaimed_channel(client::Client, sshchan)
-    idx = findfirst(x -> x.ptr == sshchan.ptr, client.unclaimed_channels)
-    if isnothing(idx)
-        error("Couldn't find the requested SshChannel in the client")
-    end
+    @lock client begin
+        idx = findfirst(x -> x.ptr == sshchan.ptr, client.unclaimed_channels)
+        if isnothing(idx)
+            error("Couldn't find the requested SshChannel in the client")
+        end
 
-    return popat!(client.unclaimed_channels, idx)
+        return popat!(client.unclaimed_channels, idx)
+    end
 end
 
 """

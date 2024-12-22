@@ -482,6 +482,10 @@ function _wait_loop(session::Session)
                 # Wakeup waiting tasks
                 @lock session._wakeup notify(session._wakeup)
                 break
+            else
+                # Ugly hack to allow other tasks to take the lock. See the
+                # comments in `listen()` in server.jl.
+                sleep(0.001)
             end
         end
     end
@@ -526,7 +530,7 @@ Wrapper around [`lib.ssh_disconnect()`](@ref).
     This will close all channels created from the session.
 """
 function disconnect(session::Session)
-    if isconnected(session)
+    @lock session if isconnected(session)
         # We close all the closeables in reverse order because closing them will
         # delete each object from the vector and we don't want to invalidate any
         # indices while deleting. The channels in particular need to be closed

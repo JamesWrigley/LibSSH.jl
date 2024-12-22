@@ -135,6 +135,9 @@ Check if the channel holds a valid pointer to a `lib.ssh_channel`.
 """
 Base.isassigned(sshchan::SshChannel) = !isnothing(sshchan.ptr)
 
+Base.lock(sshchan::SshChannel) = lock(sshchan.session)
+Base.unlock(sshchan::SshChannel) = unlock(sshchan.session)
+
 """
 $(TYPEDSIGNATURES)
 
@@ -171,6 +174,8 @@ function Base.close(sshchan::SshChannel; allow_fail=false)
         throw(ArgumentError("Calling close() on a non-owning SshChannel is not allowed to avoid accidental double-frees, see the docs for more information."))
     end
 
+    session = sshchan.session
+
     # Note that the finalizer will take the lock before calling close(), so
     # we can safely call @lock here.
     @lock sshchan.close_lock begin
@@ -186,12 +191,14 @@ function Base.close(sshchan::SshChannel; allow_fail=false)
             # Remove from the sessions list of active channels. findfirst()
             # should only return nothing if the function is being called
             # recursively (i.e. through a callback) and it was already removed.
-            idx = findfirst(x -> x === sshchan, sshchan.session.closeables)
-            if !isnothing(idx)
-                popat!(sshchan.session.closeables, idx)
+            @lock session begin
+                idx = findfirst(x -> x === sshchan, session.closeables)
+                if !isnothing(idx)
+                    popat!(session.closeables, idx)
+                end
             end
 
-            if !isnothing(sshchan.session) && !isconnected(sshchan.session)
+            if !isnothing(sshchan.session) && (@lock session !isconnected(session))
                 # If the session has already been disconnected from C
                 # (e.g. because of the other side disconnecting) then that will
                 # already have free'd the channel, which means we only need to
@@ -205,7 +212,7 @@ function Base.close(sshchan::SshChannel; allow_fail=false)
                     # This will trigger callbacks
                     ret = lib.ssh_channel_close(sshchan)
                     if ret != SSH_OK
-                        msg = "Closing SshChannel failed with $(ret): '$(get_error(sshchan.session))'"
+                        msg = "Closing SshChannel failed with $(ret): '$(get_error(session))'"
                         if allow_fail
                             # Note that we spawn to avoid task switches
                             Threads.@spawn @warn msg
@@ -249,16 +256,21 @@ Wrapper around
 [`lib.ssh_channel_write()`](@ref)/[`lib.ssh_channel_write_stderr()`](@ref).
 """
 function Base.write(sshchan::SshChannel, data::Vector{UInt8}; stderr::Bool=false)
-    if !isassigned(sshchan) || !isopen(sshchan)
-        throw(ArgumentError("SshChannel has been closed, is not writeable"))
+    ret = SSH_ERROR
+
+    @lock sshchan begin
+        if !isassigned(sshchan) || !isopen(sshchan)
+            throw(ArgumentError("SshChannel has been closed, is not writeable"))
+        end
+
+        writer = stderr ? lib.ssh_channel_write_stderr : lib.ssh_channel_write
+
+        GC.@preserve data begin
+            ptr = Ptr{Cvoid}(pointer(data))
+            ret = writer(sshchan, ptr, length(data))
+        end
     end
 
-    writer = stderr ? lib.ssh_channel_write_stderr : lib.ssh_channel_write
-
-    GC.@preserve data begin
-        ptr = Ptr{Cvoid}(pointer(data))
-        ret = writer(sshchan, ptr, length(data))
-    end
     if ret == SSH_ERROR
         throw(LibSSHException("Error when writing to channel: $(ret)"))
     end
@@ -347,26 +359,28 @@ Wrapper around [`lib.ssh_channel_send_eof()`](@ref).
   (this will result in a `Socket error: disconnected` error).
 """
 function Base.closewrite(sshchan::SshChannel; allow_fail=false)
-    # If we've already sent an EOF, do nothing
-    if sshchan.local_eof
-        return
-    end
-
-    if !iswritable(sshchan)
-        throw(ArgumentError("SshChannel has been closed, cannot send EOF"))
-    end
-
-    ret = lib.ssh_channel_send_eof(sshchan)
-    if ret != SSH_OK
-        error_msg = get_error(sshchan.session)
-        if allow_fail
-            Threads.@spawn @warn "closewrite() on SshChannel failed: '$(error_msg)'"
-        else
-            throw(LibSSHException("Error when sending EOF on channel: '$(error_msg)'"))
+    @lock sshchan begin
+        # If we've already sent an EOF, do nothing
+        if sshchan.local_eof
+            return
         end
-    end
 
-    sshchan.local_eof = true
+        if !iswritable(sshchan)
+            throw(ArgumentError("SshChannel has been closed, cannot send EOF"))
+        end
+
+        ret = lib.ssh_channel_send_eof(sshchan)
+        if ret != SSH_OK
+            error_msg = get_error(sshchan.session)
+            if allow_fail
+                Threads.@spawn @warn "closewrite() on SshChannel failed: '$(error_msg)'"
+            else
+                throw(LibSSHException("Error when sending EOF on channel: '$(error_msg)'"))
+            end
+        end
+
+        sshchan.local_eof = true
+    end
 end
 
 @deprecate channel_send_eof(sshchan::SshChannel) closewrite(sshchan)
@@ -378,11 +392,14 @@ Sends an exit status in reponse to an exec request. Wrapper around
 [`lib.ssh_channel_request_send_exit_status()`](@ref).
 """
 function channel_request_send_exit_status(sshchan::SshChannel, status::Integer)
-    if !isopen(sshchan)
-        throw(ArgumentError("SshChannel has been closed, cannot send exit status"))
+    ret = @lock sshchan begin
+        if !isopen(sshchan)
+            throw(ArgumentError("SshChannel has been closed, cannot send exit status"))
+        end
+
+        lib.ssh_channel_request_send_exit_status(sshchan, Cint(status))
     end
 
-    ret = lib.ssh_channel_request_send_exit_status(sshchan, Cint(status))
     if ret != SSH_OK
         throw(LibSSHException("Error when sending exit status on channel: $(ret)"))
     end
@@ -425,7 +442,7 @@ function poll_loop(sshchan::SshChannel; throw=true)
 
             # Note that we don't actually read any data in this loop, that's
             # handled by the callbacks, which are called by ssh_channel_poll().
-            ret = lib.ssh_channel_poll(sshchan, io_stream)
+            ret = @lock sshchan lib.ssh_channel_poll(sshchan, io_stream)
 
             # Break if there was an error, or if an EOF has been sent. We use a
             # @goto here (Knuth forgive me) to break out of the outer loop as
