@@ -195,7 +195,13 @@ mutable struct Bind
             set_message_callback(message_callback, bind, message_callback_userdata)
         end
 
-        finalizer(bind) do bind
+        finalizer(_finalizer, bind)
+    end
+end
+
+function _finalizer(bind::Bind)
+    if trylock(bind)
+        try
             close(bind)
 
             # When a SshKey (lib.ssh_key) is added to a lib.ssh_bind,
@@ -207,7 +213,11 @@ mutable struct Bind
             if !isnothing(bind.key)
                 bind.key.ptr = nothing
             end
+        finally
+            unlock(bind)
         end
+    else
+        finalizer(_finalizer, bind)
     end
 end
 
